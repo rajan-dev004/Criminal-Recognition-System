@@ -34,7 +34,53 @@ from utils.alerts import play_siren_js                   # Step 4: Play alarm
 # ============================================================
 # PAGE SETUP
 # ============================================================
+import base64
+
+def get_base64_of_bin_file(bin_file):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+def set_background(png_file):
+    bin_str = get_base64_of_bin_file(png_file)
+    page_bg_img = '''
+    <style>
+    [data-testid="stAppViewContainer"] {
+        background-image: linear-gradient(rgba(0, 0, 0, 0.4), rgba(0, 0, 0, 0.4)), url("data:image/png;base64,%s");
+        background-size: cover;
+        background-position: center;
+        background-attachment: fixed;
+    }
+    
+    [data-testid="stHeader"] {
+        background: rgba(0,0,0,0);
+    }
+    
+    [data-testid="stSidebar"] {
+        background-image: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7));
+    }
+    
+    /* Make content more readable against the background */
+    .main .block-container {
+        background: rgba(0, 0, 0, 0.6);
+        border-radius: 20px;
+        padding: 2rem;
+        margin-top: 2rem;
+        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(5px);
+        -webkit-backdrop-filter: blur(5px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    
+    h1, h2, h3, p, span, label {
+        color: #ffffff !important;
+    }
+    </style>
+    ''' % bin_str
+    st.markdown(page_bg_img, unsafe_allow_html=True)
+
 st.set_page_config(page_title="AI Security System", layout="wide")
+set_background('assets/background.png')
 st.title("🔥 AI Security System: Thief Detection & Alarm Alert")
 
 
