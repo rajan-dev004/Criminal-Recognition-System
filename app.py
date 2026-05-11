@@ -79,9 +79,9 @@ def set_background(png_file):
     ''' % bin_str
     st.markdown(page_bg_img, unsafe_allow_html=True)
 
-st.set_page_config(page_title="AI Security System", layout="wide")
+st.set_page_config(page_title="Criminal Recognition System", layout="wide")
 set_background('assets/background.png')
-st.title("🔥 AI Security System: Thief Detection & Alarm Alert")
+st.title("Criminal Recognition System")
 
 
 # ============================================================
