@@ -108,6 +108,10 @@ def get_cached_models():
 if "thief_embeddings" not in st.session_state:
     st.session_state.thief_embeddings = []
 
+# Keep track of unique filenames we've already processed to prevent duplicate embeddings on rerun
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = set()
+
 if "last_alarm_time" not in st.session_state:
     st.session_state.last_alarm_time = 0
 
@@ -198,11 +202,20 @@ class FaceRecognitionProcessor(VideoProcessorBase):
 
 # ============================================================
 # RTC CONFIGURATION — STUN servers for NAT traversal
-# (Required for WebRTC to work behind firewalls / on HF Spaces)
+# (Using multiple fallback public STUN servers)
 # ============================================================
 
 RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+            {"urls": ["stun:stun2.l.google.com:19302"]},
+            {"urls": ["stun:stun3.l.google.com:19302"]},
+            {"urls": ["stun:stun4.l.google.com:19302"]},
+            {"urls": ["stun:stun.services.mozilla.com"]},
+        ]
+    }
 )
 
 
@@ -231,25 +244,33 @@ with st.sidebar:
         new_count = 0
         mtcnn, embedder = get_cached_models()
         for uf in uploaded_files:
+            # Generate a unique key for the file to prevent duplicate processing on page reruns
+            file_key = f"{uf.name}_{uf.size}"
+            if file_key in st.session_state.processed_files:
+                continue
+
             image = Image.open(uf).convert("RGB")
             faces = detect_faces(mtcnn, image)
 
             if len(faces) == 0:
                 st.warning(f"No face detected in **{uf.name}**.")
+                st.session_state.processed_files.add(file_key)
                 continue
 
             face_img, _ = faces[0]
             emb = compute_embedding(embedder, face_img)
             st.session_state.thief_embeddings.append(emb)
+            st.session_state.processed_files.add(file_key)
             new_count += 1
 
-        if new_count:
-            st.success(f"✅ {new_count} face(s) enrolled. Total stored: {len(st.session_state.thief_embeddings)}")
+        if new_count > 0:
+            st.success(f"✅ {new_count} new face(s) enrolled. Total stored: {len(st.session_state.thief_embeddings)}")
 
     if st.session_state.thief_embeddings:
         st.info(f"👤 {len(st.session_state.thief_embeddings)} thief face(s) in memory.")
         if st.button("🗑️ Clear all thief embeddings"):
             st.session_state.thief_embeddings = []
+            st.session_state.processed_files = set()  # Reset processed files tracker
             st.rerun()
     else:
         st.warning("No thief photos uploaded yet.")
@@ -268,6 +289,14 @@ mode = st.tabs(["📹 Surveillance", "🔍 Debug / Info"])
 
 with mode[0]:
     st.subheader("Real-Time Surveillance")
+
+    # Inform the user about iframe security restrictions on Hugging Face
+    st.warning(
+        "💡 **Hugging Face Iframe Security Tip:** If you see the error *'Connection taking longer than expected'*, "
+        "it is because the browser blocks camera access inside Hugging Face's iframe wrapper.\n\n"
+        "👉 Please open the app directly using the raw Hugging Face Space URL: "
+        "**[https://rajan-2004-c-r-s.hf.space](https://rajan-2004-c-r-s.hf.space)**"
+    )
 
     if not st.session_state.thief_embeddings:
         st.info("ℹ️ Upload at least one thief photo in the sidebar to enable detection.")
