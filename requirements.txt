@@ -1,7 +1,11 @@
 streamlit
+opencv-python-headless
 numpy
-opencv-python
+pandas
+scikit-learn
 Pillow
 torch
 torchvision
 facenet-pytorch
+streamlit-webrtc
+av

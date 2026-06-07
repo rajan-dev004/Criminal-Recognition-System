@@ -1,45 +1,51 @@
 # ============================================================
 # app.py — MAIN ENTRY POINT (The Streamlit Web App)
 # ============================================================
-# This is the heart of the entire application.
-# It wires all the utility modules together and provides
-# the web-based user interface via Streamlit.
+# Uses streamlit-webrtc for cloud-compatible live camera access
+# (works on Hugging Face Spaces, unlike cv2.VideoCapture(0)).
 #
 # HOW TO RUN:
-#   source .venv/bin/activate && streamlit run app.py --server.port 8501
+#   streamlit run app.py --server.port=7860 --server.address=0.0.0.0
 #
 # HIGH-LEVEL FLOW:
 #   1. App starts → load AI models once (MTCNN + FaceNet)
 #   2. Admin uploads thief photos → detect + embed faces → store embeddings
-#   3. Webcam starts → for each frame:
+#   3. WebRTC stream → for each frame:
 #        a. Detect faces using MTCNN          (detectors.py)
 #        b. Embed each face                   (embedder.py)
 #        c. Compare with stored thief embeds  (compare.py)
 #        d. If match → draw red box + alarm   (alerts.py)
 # ============================================================
 
-import streamlit as st          # Streamlit — builds the web UI with Python
-import numpy as np              # NumPy — numerical operations (used under the hood)
-import cv2                      # OpenCV — capture webcam frames and draw boxes/text
-from PIL import Image           # PIL — convert OpenCV frames to PIL for MTCNN
-import time                     # time.sleep() to yield control between frames
+import streamlit as st
+import numpy as np
+import cv2
+from PIL import Image
+import time
+import base64
+import queue
+import threading
 
-# Import utility modules — each handles one step of the pipeline
-from utils.detectors import get_mtcnn, detect_faces      # Step 1: Detect faces
-from utils.embedder import get_embedder, compute_embedding  # Step 2: Embed faces
-from utils.compare import is_match, cosine_similarity    # Step 3: Compare embeddings
-from utils.alerts import play_siren_js                   # Step 4: Play alarm
+# streamlit-webrtc — cloud-safe real-time video streaming
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av  # PyAV — used by streamlit-webrtc to handle video frames
+
+# Import utility modules
+from utils.detectors import get_mtcnn, detect_faces
+from utils.embedder import get_embedder, compute_embedding
+from utils.compare import is_match, cosine_similarity
+from utils.alerts import play_siren_js
 
 
 # ============================================================
 # PAGE SETUP
 # ============================================================
-import base64
 
 def get_base64_of_bin_file(bin_file):
     with open(bin_file, 'rb') as f:
         data = f.read()
     return base64.b64encode(data).decode()
+
 
 def set_background(png_file):
     bin_str = get_base64_of_bin_file(png_file)
@@ -51,15 +57,15 @@ def set_background(png_file):
         background-position: center;
         background-attachment: fixed;
     }
-    
+
     [data-testid="stHeader"] {
         background: rgba(0,0,0,0);
     }
-    
+
     [data-testid="stSidebar"] {
         background-image: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7));
     }
-    
+
     /* Make content more readable against the background */
     .main .block-container {
         background: rgba(0, 0, 0, 0.6);
@@ -71,7 +77,7 @@ def set_background(png_file):
         -webkit-backdrop-filter: blur(5px);
         border: 1px solid rgba(255, 255, 255, 0.1);
     }
-    
+
     h1, h2, h3, p, span, label {
         color: #ffffff !important;
     }
@@ -79,198 +85,245 @@ def set_background(png_file):
     ''' % bin_str
     st.markdown(page_bg_img, unsafe_allow_html=True)
 
+
 st.set_page_config(page_title="Criminal Recognition System", layout="wide")
 set_background('assets/background.png')
-st.title("Criminal Recognition System")
+st.title("🚨 Criminal Recognition System")
 
 
 # ============================================================
 # SESSION STATE — Streamlit's "Memory" Between Frames
 # ============================================================
-# Streamlit reruns the entire script on every interaction.
-# st.session_state persists data across reruns so we don't
-# reload heavy AI models on every frame (would be very slow).
 
 if "thief_embeddings" not in st.session_state:
-    # List to store 512-d face vectors for each uploaded thief photo
     st.session_state.thief_embeddings = []
 
 if "embedder" not in st.session_state:
-    # Load FaceNet model once at startup — converts faces to embeddings
-    st.session_state.embedder = get_embedder()
+    with st.spinner("Loading FaceNet model…"):
+        st.session_state.embedder = get_embedder()
 
 if "mtcnn" not in st.session_state:
-    # Load MTCNN face detector once at startup — finds faces in images
-    st.session_state.mtcnn = get_mtcnn()
+    with st.spinner("Loading MTCNN detector…"):
+        st.session_state.mtcnn = get_mtcnn()
 
 if "last_alarm_time" not in st.session_state:
-    # Track the last time the alarm was played to avoid "stuttering"
     st.session_state.last_alarm_time = 0
+
+# Shared queue: VideoProcessor → Streamlit UI (for thief-detected events)
+if "alert_queue" not in st.session_state:
+    st.session_state.alert_queue = queue.Queue(maxsize=1)
+
+# Shared threshold accessible inside the VideoProcessor thread
+if "threshold" not in st.session_state:
+    st.session_state.threshold = 0.6
+
+
+# ============================================================
+# WEBRTC VIDEO PROCESSOR
+# ============================================================
+
+class FaceRecognitionProcessor(VideoProcessorBase):
+    """
+    Runs in a background thread for every incoming WebRTC video frame.
+    Each recv() call gets one video frame, processes it through the full
+    MTCNN → FaceNet → cosine-distance pipeline, annotates the frame,
+    and pushes detection results to a queue for the Streamlit UI.
+    """
+
+    def __init__(self):
+        # References to session objects — captured at creation time.
+        # These are the heavy models loaded once at app startup.
+        self.mtcnn = st.session_state.mtcnn
+        self.embedder = st.session_state.embedder
+        self.alert_queue = st.session_state.alert_queue
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        """
+        Called by streamlit-webrtc for every incoming camera frame.
+
+        Arguments:
+            frame — an av.VideoFrame (PyAV format from WebRTC stream)
+
+        Returns:
+            Annotated av.VideoFrame with bounding boxes drawn on faces.
+        """
+        # Convert PyAV frame → numpy (BGR) → PIL (RGB) for MTCNN
+        img_bgr = frame.to_ndarray(format="bgr24")
+        pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+
+        # Read current threshold and embeddings (thread-safe via Python GIL for reads)
+        threshold = st.session_state.threshold
+        thief_embeddings = st.session_state.thief_embeddings
+
+        # STEP 1: Detect all faces in this frame
+        faces = detect_faces(self.mtcnn, pil)
+
+        thief_found = False
+
+        # STEP 2 + 3: Embed each face and compare to stored thief embeddings
+        for face_img, (x1, y1, x2, y2) in faces:
+            emb = compute_embedding(self.embedder, face_img)
+
+            # Compare against every stored thief embedding
+            is_detected = False
+            if thief_embeddings:
+                distances = [cosine_similarity(emb, t) for t in thief_embeddings]
+                is_detected = any(d < threshold for d in distances)
+
+            # STEP 4: Draw colored bounding box on the original BGR frame
+            color = (0, 0, 255) if is_detected else (0, 255, 0)  # Red = thief, Green = unknown
+            label = "THIEF" if is_detected else "PERSON"
+
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                img_bgr, label,
+                (x1, max(y1 - 10, 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2
+            )
+
+            if is_detected:
+                thief_found = True
+
+        # Push detection result to queue (non-blocking; drop if queue is full)
+        try:
+            self.alert_queue.put_nowait(thief_found)
+        except queue.Full:
+            pass
+
+        # Convert annotated numpy array back to av.VideoFrame and return
+        return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
+
+
+# ============================================================
+# RTC CONFIGURATION — STUN servers for NAT traversal
+# (Required for WebRTC to work behind firewalls / on HF Spaces)
+# ============================================================
+
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 
 # ============================================================
 # SIDEBAR — Admin / Guard Control Panel
 # ============================================================
+
 with st.sidebar:
-    st.header("Admin / Guard Panel")
+    st.header("🛡️ Admin / Guard Panel")
 
-    # Slider to control how strict face matching is
-    # Lower threshold   = stricter (faces must be very similar to match)
-    # Higher threshold  = looser (more faces will trigger the alarm)
-    threshold = st.slider("Match threshold (cosine distance)", 0.1, 1.0, 0.6, 0.01)
-    st.write("Lower is stricter (faces must be very similar).")
+    threshold = st.slider(
+        "Match threshold (cosine distance)", 0.1, 1.0,
+        st.session_state.threshold, 0.01
+    )
+    st.session_state.threshold = threshold
+    st.caption("Lower = stricter match required to trigger alarm.")
 
-    # File uploader — admin uploads one or more photos of known thieves
+    st.divider()
+
     uploaded_files = st.file_uploader(
-        "Upload thief images", type=["jpg", "jpeg", "png"], accept_multiple_files=True
+        "Upload thief images", type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True
     )
 
     if uploaded_files:
-        # Process each uploaded thief image
+        new_count = 0
         for uf in uploaded_files:
-            # Open the uploaded file as a PIL Image in RGB format
             image = Image.open(uf).convert("RGB")
-
-            # STEP 1: Detect faces in the uploaded photo
             faces = detect_faces(st.session_state.mtcnn, image)
 
             if len(faces) == 0:
-                # No face found in this image — warn the admin
-                st.warning(f"No face detected in {uf.name}.")
+                st.warning(f"No face detected in **{uf.name}**.")
                 continue
 
-            # Use only the first detected face (in case there are multiple)
             face_img, _ = faces[0]
-
-            # STEP 2: Compute the 512-d embedding for this thief's face
             emb = compute_embedding(st.session_state.embedder, face_img)
-
-            # Store the embedding — this is the "memory" of what the thief looks like
             st.session_state.thief_embeddings.append(emb)
+            new_count += 1
 
-        st.success(f"Stored {len(st.session_state.thief_embeddings)} thief embeddings.")
+        if new_count:
+            st.success(f"✅ {new_count} face(s) enrolled. Total stored: {len(st.session_state.thief_embeddings)}")
+
+    if st.session_state.thief_embeddings:
+        st.info(f"👤 {len(st.session_state.thief_embeddings)} thief face(s) in memory.")
+        if st.button("🗑️ Clear all thief embeddings"):
+            st.session_state.thief_embeddings = []
+            st.rerun()
+    else:
+        st.warning("No thief photos uploaded yet.")
 
 
 # ============================================================
 # MAIN AREA — Two Tabs: Surveillance + Debug
 # ============================================================
-# st.tabs() returns a list of tab context managers
-mode = st.tabs(["Surveillance", "Debug/Info"])
+
+mode = st.tabs(["📹 Surveillance", "🔍 Debug / Info"])
 
 
 # ============================================================
-# TAB 1: REAL-TIME SURVEILLANCE
+# TAB 1: REAL-TIME SURVEILLANCE (WebRTC)
 # ============================================================
+
 with mode[0]:
     st.subheader("Real-Time Surveillance")
-    st.write("Open your webcam, detect faces, and compare with thief embeddings.")
 
-    # Checkbox to start/stop the webcam
-    run = st.checkbox("Start webcam")
-    source = st.selectbox("Video source", ["Webcam"], index=0)
+    if not st.session_state.thief_embeddings:
+        st.info("ℹ️ Upload at least one thief photo in the sidebar to enable detection.")
 
-    # Placeholder containers — updated in-place on every frame
-    frame_window = st.empty()   # Displays the live video frame
-    info_box = st.empty()       # Shows status messages (monitoring / thief detected)
-    alarm_box = st.empty()      # Hidden container for injecting alarm HTML
+    st.write("Click **START** below to activate your camera. Detection runs automatically.")
 
-    cap = None  # OpenCV video capture object
+    # Launch WebRTC streamer — this starts the camera in the browser
+    # and calls FaceRecognitionProcessor.recv() for every frame
+    ctx = webrtc_streamer(
+        key="criminal-recognition",
+        video_processor_factory=FaceRecognitionProcessor,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-    if run:
-        # Open the default webcam (device index 0)
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Could not access webcam.")
-            run = False  # Stop the loop if camera fails
+    # Status / alarm area (updated based on messages from the processor)
+    status_placeholder = st.empty()
+    alarm_placeholder = st.empty()
 
-    # --------------------------------------------------------
-    # MAIN WEBCAM LOOP — runs until "Start webcam" is unchecked
-    # --------------------------------------------------------
-    while run:
-        # Capture one frame from the webcam
-        ret, frame = cap.read()
-        if not ret:
-            # Frame read failed (camera disconnected, etc.)
-            st.warning("Failed to read frame.")
-            break
+    # Poll the alert queue and update UI when the stream is active
+    if ctx.state.playing:
+        alert_queue = st.session_state.alert_queue
 
-        # Convert frame from BGR (OpenCV default) → RGB → PIL Image
-        # MTCNN and FaceNet expect RGB PIL Images, not OpenCV BGR arrays
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
+        # Drain the queue and show latest result
+        thief_found = False
+        try:
+            while True:
+                thief_found = alert_queue.get_nowait()
+        except queue.Empty:
+            pass
 
-        # STEP 1: Detect all faces in this frame
-        faces = detect_faces(st.session_state.mtcnn, pil)
+        if thief_found:
+            status_placeholder.error("🚨 **THIEF DETECTED! Take Action Immediately!**")
 
-        alerts = []   # Collect alert messages for detected thieves
-        boxes = []    # Collect bounding boxes + whether each face is a thief
-
-        # STEP 2 + 3: For each detected face, embed + compare
-        for face_img, box in faces:
-            # Convert this face to a 512-d embedding vector
-            emb = compute_embedding(st.session_state.embedder, face_img)
-
-            # Compare this face against every stored thief embedding
-            match_scores = []
-            for thief_emb in st.session_state.thief_embeddings:
-                # cosine_similarity returns a DISTANCE (lower = more similar)
-                sim = cosine_similarity(emb, thief_emb)
-                match_scores.append(sim)
-
-            # A face is a THIEF if ANY stored embedding is below the threshold distance
-            is_detected = any(s < threshold for s in match_scores) if match_scores else False
-
-            # Record this face's bounding box and whether it's a thief
-            boxes.append((box, is_detected))
-
-            if is_detected:
-                alerts.append("THIEF DETECTED ⚠️")
-
-        # --------------------------------------------------------
-        # STEP 4: Draw bounding boxes on the original frame
-        # --------------------------------------------------------
-        for (x1, y1, x2, y2), detected in boxes:
-            # Red box for thieves, green box for unknown persons
-            color = (255, 0, 0) if detected else (0, 255, 0)
-
-            # Draw rectangle around the detected face
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Label the face as "THIEF" or "PERSON"
-            label = "THIEF" if detected else "PERSON"
-            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        # Display the annotated frame in the Streamlit UI
-        frame_window.image(frame, channels="BGR")
-
-        # STEP 4 (continued): Alert if any thief was detected
-        if alerts:
-            info_box.error("🚨 Thief Detected! Take Action!")
-            
-            # Cooldown logic: only play sound if 2 seconds have passed since last play
+            # Play alarm with cooldown
             current_time = time.time()
             if current_time - st.session_state.last_alarm_time > 2.0:
                 audio_html = play_siren_js()
-                with alarm_box:
-                    st.components.v1.html(audio_html, height=0)
+                if audio_html:
+                    with alarm_placeholder:
+                        st.components.v1.html(audio_html, height=0)
                 st.session_state.last_alarm_time = current_time
         else:
-            info_box.info("Monitoring...")
-            alarm_box.empty()
-
-        # Small sleep to yield CPU — prevents the loop from consuming 100% CPU
-        # and allows Streamlit to process any UI interactions (e.g., unchecking the box)
-        time.sleep(0.01)
-
-    # Release the webcam when the loop ends (user unchecked "Start webcam")
-    if cap is not None:
-        cap.release()
+            status_placeholder.info("🟢 Monitoring… No threats detected.")
+            alarm_placeholder.empty()
+    else:
+        status_placeholder.info("📷 Camera inactive. Click START to begin surveillance.")
 
 
 # ============================================================
 # TAB 2: DEBUG / INFO
 # ============================================================
+
 with mode[1]:
     st.subheader("Debug / Info")
-    # Show how many thief face embeddings are currently stored in memory
-    st.write("Embeddings stored:", len(st.session_state.thief_embeddings))
+    st.write("**Thief embeddings stored:**", len(st.session_state.thief_embeddings))
+    st.write("**Current threshold:**", st.session_state.threshold)
+
+    if st.session_state.thief_embeddings:
+        st.write("**Embedding shapes:**",
+                 [e.shape for e in st.session_state.thief_embeddings])
