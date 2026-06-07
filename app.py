@@ -92,19 +92,21 @@ st.title("🚨 Criminal Recognition System")
 
 
 # ============================================================
-# SESSION STATE — Streamlit's "Memory" Between Frames
+# LOAD MODELS VIA CACHE (Thread-safe, avoids st.session_state)
+# ============================================================
+
+@st.cache_resource
+def get_cached_models():
+    """Load models once globally and cache them, making them accessible to any thread."""
+    return get_mtcnn(), get_embedder()
+
+
+# ============================================================
+# SESSION STATE — Streamlit's "Memory" Between Reruns
 # ============================================================
 
 if "thief_embeddings" not in st.session_state:
     st.session_state.thief_embeddings = []
-
-if "embedder" not in st.session_state:
-    with st.spinner("Loading FaceNet model…"):
-        st.session_state.embedder = get_embedder()
-
-if "mtcnn" not in st.session_state:
-    with st.spinner("Loading MTCNN detector…"):
-        st.session_state.mtcnn = get_mtcnn()
 
 if "last_alarm_time" not in st.session_state:
     st.session_state.last_alarm_time = 0
@@ -113,9 +115,14 @@ if "last_alarm_time" not in st.session_state:
 if "alert_queue" not in st.session_state:
     st.session_state.alert_queue = queue.Queue(maxsize=1)
 
-# Shared threshold accessible inside the VideoProcessor thread
+# Shared threshold
 if "threshold" not in st.session_state:
     st.session_state.threshold = 0.6
+
+
+# Load the models on the main Streamlit thread first
+with st.spinner("Initializing AI Models..."):
+    get_cached_models()
 
 
 # ============================================================
@@ -125,35 +132,29 @@ if "threshold" not in st.session_state:
 class FaceRecognitionProcessor(VideoProcessorBase):
     """
     Runs in a background thread for every incoming WebRTC video frame.
-    Each recv() call gets one video frame, processes it through the full
-    MTCNN → FaceNet → cosine-distance pipeline, annotates the frame,
-    and pushes detection results to a queue for the Streamlit UI.
+    To avoid thread context errors, does NOT access st.session_state.
+    Instead, attributes are set from the main thread.
     """
 
     def __init__(self):
-        # References to session objects — captured at creation time.
-        # These are the heavy models loaded once at app startup.
-        self.mtcnn = st.session_state.mtcnn
-        self.embedder = st.session_state.embedder
-        self.alert_queue = st.session_state.alert_queue
+        # Load heavy models once globally (cached)
+        self.mtcnn, self.embedder = get_cached_models()
+        
+        # Placeholders to be updated by the main thread
+        self.threshold = 0.6
+        self.thief_embeddings = []
+        self.alert_queue = None
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         """
         Called by streamlit-webrtc for every incoming camera frame.
-
-        Arguments:
-            frame — an av.VideoFrame (PyAV format from WebRTC stream)
-
-        Returns:
-            Annotated av.VideoFrame with bounding boxes drawn on faces.
         """
         # Convert PyAV frame → numpy (BGR) → PIL (RGB) for MTCNN
         img_bgr = frame.to_ndarray(format="bgr24")
         pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
-        # Read current threshold and embeddings (thread-safe via Python GIL for reads)
-        threshold = st.session_state.threshold
-        thief_embeddings = st.session_state.thief_embeddings
+        threshold = self.threshold
+        thief_embeddings = self.thief_embeddings
 
         # STEP 1: Detect all faces in this frame
         faces = detect_faces(self.mtcnn, pil)
@@ -184,11 +185,12 @@ class FaceRecognitionProcessor(VideoProcessorBase):
             if is_detected:
                 thief_found = True
 
-        # Push detection result to queue (non-blocking; drop if queue is full)
-        try:
-            self.alert_queue.put_nowait(thief_found)
-        except queue.Full:
-            pass
+        # Push detection result to the shared queue if it exists
+        if self.alert_queue is not None:
+            try:
+                self.alert_queue.put_nowait(thief_found)
+            except queue.Full:
+                pass
 
         # Convert annotated numpy array back to av.VideoFrame and return
         return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
@@ -227,16 +229,17 @@ with st.sidebar:
 
     if uploaded_files:
         new_count = 0
+        mtcnn, embedder = get_cached_models()
         for uf in uploaded_files:
             image = Image.open(uf).convert("RGB")
-            faces = detect_faces(st.session_state.mtcnn, image)
+            faces = detect_faces(mtcnn, image)
 
             if len(faces) == 0:
                 st.warning(f"No face detected in **{uf.name}**.")
                 continue
 
             face_img, _ = faces[0]
-            emb = compute_embedding(st.session_state.embedder, face_img)
+            emb = compute_embedding(embedder, face_img)
             st.session_state.thief_embeddings.append(emb)
             new_count += 1
 
@@ -280,6 +283,12 @@ with mode[0]:
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
+
+    # Pass the threshold, embeddings, and queue from Streamlit thread to the background processor thread
+    if ctx.video_processor:
+        ctx.video_processor.threshold = st.session_state.threshold
+        ctx.video_processor.thief_embeddings = st.session_state.thief_embeddings
+        ctx.video_processor.alert_queue = st.session_state.alert_queue
 
     # Status / alarm area (updated based on messages from the processor)
     status_placeholder = st.empty()
