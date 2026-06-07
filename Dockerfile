@@ -23,4 +23,5 @@ COPY --chown=user . .
 
 EXPOSE 7860
 
-CMD ["streamlit", "run", "app.py", "--server.port=7860", "--server.address=0.0.0.0"]
+# Run Streamlit with disabled XSRF protection and CORS to allow file uploads inside Hugging Face iframes
+CMD ["streamlit", "run", "app.py", "--server.port=7860", "--server.address=0.0.0.0", "--server.enableXsrfProtection=false", "--server.enableCORS=false"]
