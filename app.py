@@ -1,20 +1,9 @@
 # ============================================================
 # app.py — MAIN ENTRY POINT (The Streamlit Web App)
 # ============================================================
-# Uses streamlit-webrtc for cloud-compatible live camera access
-# (works on Hugging Face Spaces, unlike cv2.VideoCapture(0)).
-#
-# HOW TO RUN:
-#   streamlit run app.py --server.port=7860 --server.address=0.0.0.0
-#
-# HIGH-LEVEL FLOW:
-#   1. App starts → load AI models once (MTCNN + FaceNet)
-#   2. Admin uploads thief photos → detect + embed faces → store embeddings
-#   3. WebRTC stream → for each frame:
-#        a. Detect faces using MTCNN          (detectors.py)
-#        b. Embed each face                   (embedder.py)
-#        c. Compare with stored thief embeds  (compare.py)
-#        d. If match → draw red box + alarm   (alerts.py)
+# Cloud-compatible surveillance app with two modes:
+#   1. Live Video (WebRTC) - Real-time processing via browser stream
+#   2. Snapshot (Standard Camera Input) - 100% reliable fallback working on all networks/devices
 # ============================================================
 
 import streamlit as st
@@ -202,31 +191,14 @@ class FaceRecognitionProcessor(VideoProcessorBase):
 
 # ============================================================
 # RTC CONFIGURATION — STUN/TURN servers for NAT traversal
-# (Using public STUN servers and Open Relay TURN servers for robust connection)
+# (Using public Google STUN servers)
 # ============================================================
 
 RTC_CONFIGURATION = RTCConfiguration(
     {
         "iceServers": [
-            # STUN Servers
             {"urls": ["stun:stun.l.google.com:19302"]},
             {"urls": ["stun:stun1.l.google.com:19302"]},
-            {"urls": ["stun:stun2.l.google.com:19302"]},
-            {"urls": ["stun:stun3.l.google.com:19302"]},
-            {"urls": ["stun:stun4.l.google.com:19302"]},
-            {"urls": ["stun:stun.services.mozilla.com"]},
-            
-            # Open Relay TURN Servers (Relays WebRTC traffic through ports 80/443 to bypass strict firewalls/NATs)
-            {
-                "urls": ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-            {
-                "urls": ["turns:openrelay.metered.ca:443"],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            }
         ]
     }
 )
@@ -297,73 +269,139 @@ mode = st.tabs(["📹 Surveillance", "🔍 Debug / Info"])
 
 
 # ============================================================
-# TAB 1: REAL-TIME SURVEILLANCE (WebRTC)
+# TAB 1: REAL-TIME SURVEILLANCE
 # ============================================================
 
 with mode[0]:
     st.subheader("Real-Time Surveillance")
 
-    # Inform the user about iframe security restrictions on Hugging Face
-    st.warning(
-        "💡 **Hugging Face Iframe Security Tip:** If you see the error *'Connection taking longer than expected'*, "
-        "it is because the browser blocks camera access inside Hugging Face's iframe wrapper.\n\n"
-        "👉 Please open the app directly using the raw Hugging Face Space URL: "
-        "**[https://rajan-2004-c-r-s.hf.space](https://rajan-2004-c-r-s.hf.space)**"
-    )
-
     if not st.session_state.thief_embeddings:
         st.info("ℹ️ Upload at least one thief photo in the sidebar to enable detection.")
 
-    st.write("Click **START** below to activate your camera. Detection runs automatically.")
-
-    # Launch WebRTC streamer — this starts the camera in the browser
-    # and calls FaceRecognitionProcessor.recv() for every frame
-    ctx = webrtc_streamer(
-        key="criminal-recognition",
-        video_processor_factory=FaceRecognitionProcessor,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
+    # Choose between Live WebRTC Stream and Native Snapshot Camera Input
+    surveillance_type = st.radio(
+        "Select Camera Mode:",
+        ["Snapshot Mode (100% Reliable Fallback)", "Live Video Stream (WebRTC)"],
+        help="Use Snapshot Mode if WebRTC fails to connect due to network/firewall restrictions."
     )
 
-    # Pass the threshold, embeddings, and queue from Streamlit thread to the background processor thread
-    if ctx.video_processor:
-        ctx.video_processor.threshold = st.session_state.threshold
-        ctx.video_processor.thief_embeddings = st.session_state.thief_embeddings
-        ctx.video_processor.alert_queue = st.session_state.alert_queue
+    # --------------------------------------------------------
+    # MODE A: SNAPSHOT CAMERA INPUT (100% reliable, works everywhere)
+    # --------------------------------------------------------
+    if surveillance_type == "Snapshot Mode (100% Reliable Fallback)":
+        st.write("Take a photo using your camera to scan for registered thieves.")
+        
+        # Native Streamlit camera input widget (does not use WebRTC)
+        camera_img = st.camera_input("Surveillance Camera")
 
-    # Status / alarm area (updated based on messages from the processor)
-    status_placeholder = st.empty()
-    alarm_placeholder = st.empty()
-
-    # Poll the alert queue and update UI when the stream is active
-    if ctx.state.playing:
-        alert_queue = st.session_state.alert_queue
-
-        # Drain the queue and show latest result
-        thief_found = False
-        try:
-            while True:
-                thief_found = alert_queue.get_nowait()
-        except queue.Empty:
-            pass
-
-        if thief_found:
-            status_placeholder.error("🚨 **THIEF DETECTED! Take Action Immediately!**")
-
-            # Play alarm with cooldown
-            current_time = time.time()
-            if current_time - st.session_state.last_alarm_time > 2.0:
-                audio_html = play_siren_js()
-                if audio_html:
-                    with alarm_placeholder:
+        if camera_img is not None:
+            # Load the captured image
+            pil_img = Image.open(camera_img).convert("RGB")
+            
+            # Load models
+            mtcnn, embedder = get_cached_models()
+            
+            # Detect faces
+            faces = detect_faces(mtcnn, pil_img)
+            
+            if len(faces) == 0:
+                st.info("Monitoring… No faces detected in the snapshot.")
+            else:
+                # Convert PIL to BGR numpy array for drawing
+                img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                thief_detected = False
+                
+                # Check each detected face
+                for face_img, (x1, y1, x2, y2) in faces:
+                    emb = compute_embedding(embedder, face_img)
+                    
+                    is_detected = False
+                    if st.session_state.thief_embeddings:
+                        distances = [cosine_similarity(emb, t) for t in st.session_state.thief_embeddings]
+                        is_detected = any(d < st.session_state.threshold for d in distances)
+                        
+                    color = (0, 0, 255) if is_detected else (0, 255, 0)
+                    label = "THIEF" if is_detected else "PERSON"
+                    
+                    cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 3)
+                    cv2.putText(
+                        img_bgr, label,
+                        (x1, max(y1 - 15, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                    )
+                    
+                    if is_detected:
+                        thief_detected = True
+                
+                # Display result
+                st.image(img_bgr, channels="BGR", caption="Processed Snapshot Result")
+                
+                if thief_detected:
+                    st.error("🚨 **THIEF DETECTED! Take Action Immediately!**")
+                    
+                    # Trigger the siren alert
+                    audio_html = play_siren_js()
+                    if audio_html:
                         st.components.v1.html(audio_html, height=0)
-                st.session_state.last_alarm_time = current_time
-        else:
-            status_placeholder.info("🟢 Monitoring… No threats detected.")
-            alarm_placeholder.empty()
+                else:
+                    st.success("🟢 Scan Complete. No threats detected.")
+
+    # --------------------------------------------------------
+    # MODE B: LIVE VIDEO STREAM (WebRTC)
+    # --------------------------------------------------------
     else:
-        status_placeholder.info("📷 Camera inactive. Click START to begin surveillance.")
+        st.warning(
+            "💡 **WebRTC Connection Tip:** If you see the error *'Connection taking longer than expected'*, "
+            "it is due to a firewall or router policy blocking peer-to-peer UDP traffic on your network.\n\n"
+            "👉 Switch to **Snapshot Mode** above to run the system with 100% reliability."
+        )
+
+        st.write("Click **START** below to activate your live video feed.")
+
+        # Launch WebRTC streamer
+        ctx = webrtc_streamer(
+            key="criminal-recognition",
+            video_processor_factory=FaceRecognitionProcessor,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+
+        # Pass parameters to the background processor thread
+        if ctx.video_processor:
+            ctx.video_processor.threshold = st.session_state.threshold
+            ctx.video_processor.thief_embeddings = st.session_state.thief_embeddings
+            ctx.video_processor.alert_queue = st.session_state.alert_queue
+
+        status_placeholder = st.empty()
+        alarm_placeholder = st.empty()
+
+        # Poll the alert queue and update UI
+        if ctx.state.playing:
+            alert_queue = st.session_state.alert_queue
+            thief_found = False
+            try:
+                while True:
+                    thief_found = alert_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            if thief_found:
+                status_placeholder.error("🚨 **THIEF DETECTED! Take Action Immediately!**")
+
+                # Play alarm with cooldown
+                current_time = time.time()
+                if current_time - st.session_state.last_alarm_time > 2.0:
+                    audio_html = play_siren_js()
+                    if audio_html:
+                        with alarm_placeholder:
+                            st.components.v1.html(audio_html, height=0)
+                    st.session_state.last_alarm_time = current_time
+            else:
+                status_placeholder.info("🟢 Monitoring… No threats detected.")
+                alarm_placeholder.empty()
+        else:
+            status_placeholder.info("📷 Camera inactive. Click START to begin surveillance.")
 
 
 # ============================================================
