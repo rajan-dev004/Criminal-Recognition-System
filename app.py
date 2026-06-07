@@ -201,19 +201,32 @@ class FaceRecognitionProcessor(VideoProcessorBase):
 
 
 # ============================================================
-# RTC CONFIGURATION — STUN servers for NAT traversal
-# (Using multiple fallback public STUN servers)
+# RTC CONFIGURATION — STUN/TURN servers for NAT traversal
+# (Using public STUN servers and Open Relay TURN servers for robust connection)
 # ============================================================
 
 RTC_CONFIGURATION = RTCConfiguration(
     {
         "iceServers": [
+            # STUN Servers
             {"urls": ["stun:stun.l.google.com:19302"]},
             {"urls": ["stun:stun1.l.google.com:19302"]},
             {"urls": ["stun:stun2.l.google.com:19302"]},
             {"urls": ["stun:stun3.l.google.com:19302"]},
             {"urls": ["stun:stun4.l.google.com:19302"]},
             {"urls": ["stun:stun.services.mozilla.com"]},
+            
+            # Open Relay TURN Servers (Relays WebRTC traffic through ports 80/443 to bypass strict firewalls/NATs)
+            {
+                "urls": ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": ["turns:openrelay.metered.ca:443"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            }
         ]
     }
 )
