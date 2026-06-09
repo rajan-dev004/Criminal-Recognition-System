@@ -269,11 +269,19 @@ with mode[0]:
             if IS_CLOUD:
                 st.info("☁️ Running on Hugging Face Spaces — real-time detection via WebRTC.")
 
-                # RTC Configuration — public STUN servers for NAT traversal
+                # RTC Configuration — STUN and TURN servers for NAT traversal on Hugging Face Spaces
                 RTC_CONFIGURATION = {
                     "iceServers": [
                         {"urls": ["stun:stun.l.google.com:19302"]},
-                        {"urls": ["stun:stun1.l.google.com:19302"]},
+                        {
+                            "urls": [
+                                "turn:openrelay.metered.ca:80",
+                                "turn:openrelay.metered.ca:443",
+                                "turn:openrelay.metered.ca:443?transport=tcp"
+                            ],
+                            "username": "openrelayproject",
+                            "credential": "openrelayproject"
+                        }
                     ]
                 }
 
